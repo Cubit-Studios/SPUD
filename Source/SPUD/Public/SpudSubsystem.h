@@ -10,6 +10,7 @@
 
 #include "SpudSubsystem.generated.h"
 
+class USpudRuntimeStoredActorComponent;
 DECLARE_LOG_CATEGORY_EXTERN(LogSpudSubsystem, Verbose, Verbose);
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FSpudPreLoadGame, const FString&, SlotName);
@@ -69,7 +70,7 @@ class SPUD_API USpudStreamingLevelWrapper : public UObject
 
 public:
 	UPROPERTY()
-	ULevelStreaming* LevelStreaming;
+	TObjectPtr<ULevelStreaming> LevelStreaming;
 
 	UFUNCTION()
 	void OnLevelShown();
@@ -145,7 +146,11 @@ public:
 	/// The desired height of screenshots taken for save games
 	UPROPERTY(BlueprintReadWrite, Config)
 	int32 ScreenshotHeight = 135;
-	FDelegateHandle OnScreenshotHandle;
+
+	FDelegateHandle OnScreenshotCapturedHandle;
+	FDelegateHandle OnScreenshotRequestProcessedHandle;
+
+	FString ScreenshotFileName;
 
 	/// If true, use the show/hide events of streaming levels to save/load, which is compatible with World Partition
 	/// You can set this to false to change to the legacy mode which requires ASpudStreamingVolume
@@ -158,6 +163,9 @@ public:
 	/// Case insensitive.
 	UPROPERTY(BlueprintReadWrite, Config)
 	TArray<FString> ExcludeLevelNamePatterns;
+
+	UPROPERTY(BlueprintReadOnly)
+	TSet<TObjectPtr<USpudRuntimeStoredActorComponent>> RegisteredRuntimeStoredActorComponents;
 
 protected:
 	FDelegateHandle OnPreLoadMapHandle;
@@ -226,7 +234,7 @@ protected:
 	TMap<FName, FStreamLevelRequests> LevelRequests;
 
 	UPROPERTY()
-	TMap<ULevelStreaming*, USpudStreamingLevelWrapper*> MonitoredStreamingLevels;
+	TMap<TObjectPtr<ULevelStreaming>, TObjectPtr<USpudStreamingLevelWrapper>> MonitoredStreamingLevels;
 
 	bool ServerCheck(bool LogWarning) const;
 
@@ -262,6 +270,9 @@ protected:
 	void ScreenshotTimedOut();
 	UFUNCTION()
     void OnScreenshotCaptured(int32 Width, int32 Height, const TArray<FColor>& Colours);
+	UFUNCTION()
+    void OnScreenshotRequestProcessed();
+	void ResetScreenshotState();
 
 	void FinishSaveGame(const FString& SlotName, const FText& Title, const USpudCustomSaveInfo* ExtraInfo, TArray<uint8>* ScreenshotData);
 	void LoadComplete(const FString& SlotName, bool bSuccess);
@@ -276,6 +287,8 @@ protected:
 	void StopUnloadTimer();
 	void CheckStreamUnload();
 	void UnloadStreamLevel(FName LevelName);
+
+	void UpdateRegisteredComps();
 
 public:
 
@@ -534,6 +547,14 @@ public:
 	UFUNCTION(BlueprintCallable)
 	bool ShouldStoreLevel(const ULevel* Level);
 
+	/// Save render target to save file
+	UFUNCTION(BlueprintCallable)
+	void SetRenderTargetData(FString Name, UTextureRenderTarget2D* RenderTarget);
+
+	/// Load render target to a texture
+	UFUNCTION(BlueprintCallable)
+	UTexture2D* GetRenderTargetData(FString Name);
+	
 	/// Store actor by cell
 	void StoreActorByCell(AActor* Actor, const FString& CellName);
 

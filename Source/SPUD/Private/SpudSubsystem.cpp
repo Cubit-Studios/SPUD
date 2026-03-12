@@ -1,13 +1,21 @@
 #include "SpudSubsystem.h"
-#include "EngineUtils.h"
 #include "SpudState.h"
 #include "Engine/LevelStreaming.h"
 #include "Engine/LocalPlayer.h"
 #include "Kismet/GameplayStatics.h"
 #include "ImageUtils.h"
+#include "SpudRuntimeStoredActorComponent.h"
 #include "TimerManager.h"
 #include "HAL/FileManager.h"
 #include "Async/Async.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "Kismet/KismetRenderingLibrary.h"
+
+#ifdef USE_SAVEGAMESYSTEM
+#include "SaveGameSystem.h"
+//needed
+#include "PlatformFeatures.h"
+#endif
 
 DEFINE_LOG_CATEGORY(LogSpudSubsystem)
 
@@ -198,9 +206,14 @@ void USpudSubsystem::OnPreLoadMap(const FString& MapName)
 		if (IsValid(World))
 		{
 			UE_LOG(LogSpudSubsystem, Verbose, TEXT("OnPreLoadMap saving: %s"), *UGameplayStatics::GetCurrentLevelName(World));
+#ifdef USE_SAVEGAMESYSTEM
+			// Keep it in memory
+			StoreWorld(World, false, true);
+#else
 			// Map and all streaming level data will be released.
 			// Block while doing it so they all get written predictably
 			StoreWorld(World, true, true);
+#endif
 		}
 	}
 }
@@ -218,7 +231,8 @@ void USpudSubsystem::OnSeamlessTravelTransition(UWorld* World)
 
 void USpudSubsystem::OnPostLoadMap(UWorld* World)
 {
-	if (!ServerCheck(false))
+	// Issue #130: double-check that world has authority as well, GameInstance can be null?
+	if (!ServerCheck(false) || (World && World->GetNetMode() >= NM_Client))
 		return;
 
 
@@ -312,8 +326,10 @@ void USpudSubsystem::SaveGame(const FString& SlotName, const FText& Title, bool 
 		TitleInProgress = Title;
 		ExtraInfoInProgress = ExtraInfo;
 		UGameViewportClient* ViewportClient = UGameplayStatics::GetPlayerController(GetWorld(), 0)->GetLocalPlayer()->ViewportClient;
-		OnScreenshotHandle = ViewportClient->OnScreenshotCaptured().AddUObject(this, &USpudSubsystem::OnScreenshotCaptured);
+		OnScreenshotCapturedHandle = ViewportClient->OnScreenshotCaptured().AddUObject(this, &USpudSubsystem::OnScreenshotCaptured);
+		OnScreenshotRequestProcessedHandle = FScreenshotRequest::OnScreenshotRequestProcessed().AddUObject(this, &USpudSubsystem::OnScreenshotRequestProcessed);
 		FScreenshotRequest::RequestScreenshot(false);
+		ScreenshotFileName = FScreenshotRequest::GetFilename();
 		// OnScreenShotCaptured will finish
 		// EXCEPT that if a Widget BP is open in the editor, this request will disappear into nowhere!! (4.26.1)
 		// So we need a failsafe
@@ -343,11 +359,7 @@ void USpudSubsystem::ScreenshotTimedOut()
 
 void USpudSubsystem::OnScreenshotCaptured(int32 Width, int32 Height, const TArray<FColor>& Colours)
 {
-	ScreenshotTimeout = 0;
-
-	UGameViewportClient* ViewportClient = UGameplayStatics::GetPlayerController(GetWorld(), 0)->GetLocalPlayer()->ViewportClient;
-	ViewportClient->OnScreenshotCaptured().Remove(OnScreenshotHandle);
-	OnScreenshotHandle.Reset();
+	ResetScreenshotState();
 
 	// Downscale the screenshot, pass to finish
 	TArray<FColor> RawDataCroppedResized;
@@ -362,8 +374,36 @@ void USpudSubsystem::OnScreenshotCaptured(int32 Width, int32 Height, const TArra
 #endif
 	
 	FinishSaveGame(SlotNameInProgress, TitleInProgress, ExtraInfoInProgress, &PngData);
-	
 }
+
+void USpudSubsystem::ResetScreenshotState()
+{
+	ScreenshotTimeout = 0;
+
+	const auto ViewportClient = UGameplayStatics::GetPlayerController(GetWorld(), 0)->GetLocalPlayer()->ViewportClient;
+	ViewportClient->OnScreenshotCaptured().Remove(OnScreenshotCapturedHandle);
+
+	FScreenshotRequest::OnScreenshotRequestProcessed().Remove(OnScreenshotRequestProcessedHandle);
+
+	OnScreenshotCapturedHandle.Reset();
+	OnScreenshotRequestProcessedHandle.Reset();
+}
+
+void USpudSubsystem::OnScreenshotRequestProcessed()
+{
+	// handles HDR screenshots
+
+	FImage Image;
+	FImageUtils::LoadImage(*ScreenshotFileName, Image);
+
+	// clean up temp screenshot
+	IFileManager::Get().Delete(*ScreenshotFileName);
+
+	Image.ChangeFormat(ERawImageFormat::BGRA8, Image.GammaSpace);
+
+	OnScreenshotCaptured(Image.GetWidth(), Image.GetHeight(), TArray<FColor>(Image.AsBGRA8()));
+}
+
 void USpudSubsystem::FinishSaveGame(const FString& SlotName, const FText& Title, const USpudCustomSaveInfo* ExtraInfo, TArray<uint8>* ScreenshotData)
 {
 	auto State = GetActiveState();
@@ -394,7 +434,55 @@ void USpudSubsystem::FinishSaveGame(const FString& SlotName, const FText& Title,
 	State->SetCustomSaveInfo(ExtraInfo);
 	if (ScreenshotData)
 		State->SetScreenshot(*ScreenshotData);
+
+#ifdef USE_SAVEGAMESYSTEM
+	// VIVI: Consoles require using the SaveGameSystem
+	ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
+	bool SaveOK;
+
+	if (SaveSystem)
+	{
+		TArray<uint8> OutSaveData;
+		auto Archive = FMemoryWriter(OutSaveData, true);
+		State->SaveToArchive(Archive);
+		Archive.Close();
+
+		if (Archive.IsError() || Archive.IsCriticalError())
+		{
+			UE_LOG(LogSpudSubsystem, Error, TEXT("Error while creating save game for slot %s"), *SlotName);
+			SaveOK = false;
+		}
+		else
+		{
+			if (OutSaveData.Num() > 0 && SlotName.Len() > 0)
+			{
+				// VIVI: 0 = first player controller. Figure out if there's a better way to do this.
+				if (!SaveSystem->SaveGame(false, *SlotName, 0, OutSaveData))
+				{
+					UE_LOG(LogSpudSubsystem, Error, TEXT("Error while saving game to %s"), *SlotName);
+					SaveOK = false;
+				}
+				else
+				{
+					UE_LOG(LogSpudSubsystem, Log, TEXT("Save to slot %s: Success"), *SlotName);
+					SaveOK = true;
+				}
+			}
+			else
+			{
+				UE_LOG(LogSpudSubsystem, Error, TEXT("Error while creating save game for slot %s"), *SlotName);
+				SaveOK = false;
+			}
+		}
+	}
+	else
+	{
+		SaveOK = false;
+	}
+
+	SaveComplete(SlotName, SaveOK);
 	
+#else
 	// UGameplayStatics::SaveGameToSlot prefixes our save with a lot of crap that we don't need
 	// And also wraps it with FObjectAndNameAsStringProxyArchive, which again we don't need
 	// Plus it writes it all to memory first, which we don't need another copy of. Write direct to file
@@ -428,7 +516,7 @@ void USpudSubsystem::FinishSaveGame(const FString& SlotName, const FText& Title,
 	}
 
 	SaveComplete(SlotName, SaveOK);
-
+#endif
 }
 
 void USpudSubsystem::SaveComplete(const FString& SlotName, bool bSuccess)
@@ -443,6 +531,9 @@ void USpudSubsystem::SaveComplete(const FString& SlotName, bool bSuccess)
 
 void USpudSubsystem::HandleLevelLoaded(FName LevelName)
 {
+	if (!ServerCheck(false))
+		return;
+	
 	// Defer the restore to the game thread, streaming calls happen in loading thread?
 	// However, quickly ping the state to force it to pre-load the leveldata
 	// that way the loading occurs in this thread, less latency
@@ -464,6 +555,9 @@ void USpudSubsystem::HandleLevelLoaded(FName LevelName)
 
 void USpudSubsystem::HandleLevelUnloaded(ULevel* Level)
 {
+	if (!ServerCheck(false))
+		return;
+	
 	if (ShouldStoreLevel(Level))
 	{
 		UnsubscribeLevelObjectEvents(Level);
@@ -529,6 +623,38 @@ void USpudSubsystem::LoadGame(const FString& SlotName, const FString& TravelOpti
 
 	State->ResetState();
 
+#ifdef USE_SAVEGAMESYSTEM
+	
+	// VIVI: Consoles require using the SaveGameSystem
+	ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
+
+	if (SaveSystem)
+	{
+		TArray<uint8> InSaveData;
+		if (SaveSystem->LoadGame(false, *SlotName, 0, InSaveData))
+		{
+			auto Archive = FMemoryReader(InSaveData, true);
+			// Whole thing is in memory, might as well load it all
+			State->LoadFromArchive(Archive, true);
+			Archive.Close();
+
+			if (Archive.IsError() || Archive.IsCriticalError())
+			{
+				UE_LOG(LogSpudSubsystem, Error, TEXT("Error while loading game from %s"), *SlotName);
+				LoadComplete(SlotName, false);
+				return;
+			}
+		}
+		else
+		{
+			UE_LOG(LogSpudSubsystem, Error, TEXT("Error while loading game from %s"), *SlotName);
+			LoadComplete(SlotName, false);
+			return;
+		}
+	}
+	
+#else
+
 	// TODO: async load
 
 	IFileManager& FileMgr = IFileManager::Get();
@@ -553,6 +679,9 @@ void USpudSubsystem::LoadGame(const FString& SlotName, const FString& TravelOpti
 		LoadComplete(SlotName, false);
 		return;
 	}
+	
+#endif
+
 
     // The world package gets loaded way before we end up loading the world
     // this cause an issue with the world being garbage collected from the package before we load, thus the load failing
@@ -604,8 +733,9 @@ void USpudSubsystem::LoadComplete(const FString& SlotName, bool bSuccess)
 {
 	CurrentState = ESpudSystemState::RunningIdle;
 	IsRestoringState = false;
-	SlotNameInProgress = "";
 	PostLoadGame.Broadcast(SlotName, bSuccess);
+	// It's possible that the reference to SlotName *is* SlotNameInProgress, so we can't reset it until after
+	SlotNameInProgress = "";
 	
 	WorldToLoad = nullptr;
 }
@@ -614,9 +744,20 @@ bool USpudSubsystem::DeleteSave(const FString& SlotName)
 {
 	if (!ServerCheck(true))
 		return false;
-	
+
+#ifdef USE_SAVEGAMESYSTEM
+	// VIVI: Consoles require using the SaveGameSystem
+	ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
+
+	if (SaveSystem)
+	{
+		return SaveSystem->DeleteGame(false, *SlotName, 0);
+	}
+	return false;
+#else
 	IFileManager& FileMgr = IFileManager::Get();
 	return FileMgr.Delete(*GetSaveGameFilePath(SlotName), false, true);
+#endif
 }
 
 void USpudSubsystem::AddPersistentGlobalObject(UObject* Obj)
@@ -867,6 +1008,27 @@ void USpudSubsystem::UnloadStreamLevel(FName LevelName)
 	}	
 }
 
+void USpudSubsystem::UpdateRegisteredComps()
+{
+	// Ticking registered comp's owner is moving outside the loaded area.
+	TArray<USpudRuntimeStoredActorComponent*> NeedToDestroyArray;
+	for (const auto RegComp : RegisteredRuntimeStoredActorComponents)
+	{
+		bool bCellActivated;
+		RegComp->UpdateCurrentCell(bCellActivated);
+		if (!bCellActivated)
+		{
+			NeedToDestroyArray.Add(RegComp);
+		}
+	}
+
+	for (auto Destroy : NeedToDestroyArray)
+	{
+		StoreActorByCell(Destroy->GetOwner(), Destroy->CurrentCellName);
+		Destroy->DestroyActor();
+	}
+}
+
 void USpudSubsystem::ForceReset()
 {
 	CurrentState = ESpudSystemState::RunningIdle;
@@ -916,6 +1078,19 @@ bool USpudSubsystem::ShouldStoreLevel(const ULevel* Level)
 		}
 	}
 	return true;
+}
+
+void USpudSubsystem::SetRenderTargetData(FString Name, UTextureRenderTarget2D* RenderTarget)
+{
+	UKismetRenderingLibrary::ExportRenderTarget(GetWorld(), RenderTarget, GetSaveGameDirectory(), Name + ".png");
+}
+
+UTexture2D* USpudSubsystem::GetRenderTargetData(FString Name)
+{
+	UTexture2D* texture = nullptr;
+	FString TotalFileName = FPaths::Combine(GetSaveGameDirectory(), Name + ".png");
+	texture = FImageUtils::ImportFileAsTexture2D(TotalFileName);
+	return texture;
 }
 
 void USpudSubsystem::StoreActorByCell(AActor* Actor, const FString& CellName)
@@ -1055,6 +1230,51 @@ TArray<USpudSaveGameInfo*> USpudSubsystem::GetSaveGameList(bool bIncludeQuickSav
 
 USpudSaveGameInfo* USpudSubsystem::GetSaveGameInfo(const FString& SlotName)
 {
+
+#ifdef USE_SAVEGAMESYSTEM
+	
+	// VIVI: Consoles require using the SaveGameSystem
+	ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
+
+	if (SaveSystem)
+	{
+		TArray<uint8> InSaveData;
+		// Usually we'd want to parse just the very first part of the file, not all of it.
+		// But the Save Game System has to give us the entire thing.
+		if (SaveSystem->LoadGame(false, *SlotName, 0, InSaveData))
+		{
+			auto Archive = FMemoryReader(InSaveData, true);
+
+			if (Archive.IsError() || Archive.IsCriticalError())
+			{
+				UE_LOG(LogSpudSubsystem, Error, TEXT("Unable to open slot %s for reading info"), *SlotName);
+				return nullptr;
+			}
+			
+
+			auto Info = NewObject<USpudSaveGameInfo>();
+			Info->SlotName = SlotName;
+
+			const bool bResult = USpudState::LoadSaveInfoFromArchive(Archive, *Info);
+			Archive.Close();
+
+			return bResult ? Info : nullptr;
+		}
+		else
+		{
+			UE_LOG(LogSpudSubsystem, Error, TEXT("Unable to open slot %s for reading info"), *SlotName);
+			return nullptr;
+		}
+	}
+	else
+	{
+		UE_LOG(LogSpudSubsystem, Error, TEXT("Unable to open slot %s for reading info"), *SlotName);
+		return nullptr;
+	}
+
+	
+#else
+
 	IFileManager& FM = IFileManager::Get();
 	// We want to parse just the very first part of the file, not all of it
 	FString AbsoluteFilename = FPaths::Combine(GetSaveGameDirectory(), SlotName + ".sav");
@@ -1073,6 +1293,8 @@ USpudSaveGameInfo* USpudSubsystem::GetSaveGameInfo(const FString& SlotName)
 	Archive->Close();
 
 	return bResult ? Info : nullptr;
+	
+#endif
 }
 
 USpudSaveGameInfo* USpudSubsystem::GetLatestSaveGame()
@@ -1110,9 +1332,19 @@ FString USpudSubsystem::GetSaveGameFilePath(const FString& SlotName)
 
 void USpudSubsystem::ListSaveGameFiles(TArray<FString>& OutSaveFileList)
 {
+#ifdef USE_SAVEGAMESYSTEM
+	// VIVI: Consoles require using the SaveGameSystem
+	ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
+
+	if (SaveSystem)
+	{
+		SaveSystem->GetSaveGameNames(OutSaveFileList, 0);
+	}
+#else
 	IFileManager& FM = IFileManager::Get();
 
-	FM.FindFiles(OutSaveFileList, *GetSaveGameDirectory(), TEXT(".sav"));	
+	FM.FindFiles(OutSaveFileList, *GetSaveGameDirectory(), TEXT(".sav"));
+#endif
 }
 
 FString USpudSubsystem::GetActiveGameFolder()
@@ -1159,10 +1391,61 @@ public:
 			if (!UpgradeCallback.IsBound())
 				return;
 			
-			IFileManager& FileMgr = IFileManager::Get();
 			TArray<FString> SaveFiles;
 			USpudSubsystem::ListSaveGameFiles(SaveFiles);
 
+#ifdef USE_SAVEGAMESYSTEM
+			// VIVI: Consoles require using the SaveGameSystem
+			ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
+
+			if (SaveSystem)
+			{
+				for (auto && SaveFile : SaveFiles)
+				{
+					TArray<uint8> InSaveData;
+					if (SaveSystem->LoadGame(false, *SaveFile, 0, InSaveData))
+					{
+						auto Archive = FMemoryReader(InSaveData, true);	
+
+						auto State = NewObject<USpudState>();
+						// Load all data because we want to upgrade
+						State->LoadFromArchive(Archive, true);
+						Archive.Close();
+
+						if (Archive.IsError() || Archive.IsCriticalError())
+						{
+							UE_LOG(LogSpudSubsystem, Error, TEXT("Error while loading game to check for upgrades: %s"), *SaveFile);
+							continue;
+						}
+
+						if (bUpgradeAlways || SaveNeedsUpgrading(State))
+						{
+							if (UpgradeCallback.Execute(State))
+							{
+								// VIVI: Do we really want to make a new "old" save?
+								SaveSystem->SaveGame(false, *FString::Printf(TEXT("%s_Backup"), *SaveFile), 0, InSaveData);
+								
+								// Now save
+								TArray<uint8> OutSaveData;
+								auto OutArchive = FMemoryWriter(OutSaveData, true);
+								State->SaveToArchive(Archive);
+								OutArchive.Close();
+								
+								if (OutSaveData.Num() > 0 && SaveFile.Len() > 0)
+								{
+									// VIVI: 0 = first player controller. Figure out if there's a better way to do this.
+									if (!SaveSystem->SaveGame(false, *SaveFile, 0, OutSaveData))
+									{
+										UE_LOG(LogSpudSubsystem, Error, TEXT("Error while upgrading save %s"), *SaveFile);
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+#else
+			IFileManager& FileMgr = IFileManager::Get();
 			for (auto && SaveFile : SaveFiles)
 			{
 				FString AbsoluteFilename = FPaths::Combine(USpudSubsystem::GetSaveGameDirectory(), SaveFile);
@@ -1198,6 +1481,7 @@ public:
 					}
 				}
 			}
+#endif
 
 		}
 
@@ -1274,7 +1558,8 @@ void USpudSubsystem::Tick(float DeltaTime)
 	if (bSupportWorldPartition)
 	{
 		auto world = GetWorld();
-		if (world)
+		// only for authority.
+		if (world && world->GetAuthGameMode())
 		{
 			TSet<ULevelStreaming*> streamingLevels(world->GetStreamingLevels());
 
@@ -1297,7 +1582,7 @@ void USpudSubsystem::Tick(float DeltaTime)
 			// Discard unloaded levels.
 			for (auto it = MonitoredStreamingLevels.CreateIterator(); it; ++it)
 			{
-				if (const auto Level = it.Key(); !streamingLevels.Contains(Level))
+				if (const auto Level = it.Key(); Level && !streamingLevels.Contains(Level))
 				{
 					UE_LOG(LogSpudSubsystem, Verbose, TEXT("Unloaded streaming level: %s"), *GetNameSafe(Level));
 					check(!Level->IsLevelVisible());
@@ -1308,6 +1593,8 @@ void USpudSubsystem::Tick(float DeltaTime)
 					PostUnloadStreamingLevel.Broadcast(FName(USpudState::GetLevelName(Level->GetWorldAssetPackageName())));
 				}
 			}
+
+			UpdateRegisteredComps();
 		}
 	}
 }

@@ -3,7 +3,7 @@
 
 #include "EngineUtils.h"
 #include "ISpudObject.h"
-#include "..\Public\SpudMemoryReaderWriter.h"
+#include "SpudMemoryReaderWriter.h"
 #if ENGINE_MAJOR_VERSION==5&&ENGINE_MINOR_VERSION>=5
 #include "StructUtils/InstancedStruct.h"
 #else
@@ -541,6 +541,25 @@ FString SpudPropertyUtil::WriteNestedUObjectPropertyData(FObjectProperty* OProp,
 	return Ret;
 }
 
+FString SpudPropertyUtil::WriteSoftObjectPropertyData(FSoftObjectProperty* SProp,
+												 uint32 PrefixID,
+												 const void* Data,
+												 bool bIsArrayElement,
+												 TSharedPtr<FSpudClassDef> ClassDef,
+												 TArray<uint32>& PropertyOffsets,
+												 FSpudClassMetadata& Meta,
+												 FArchive& Out)
+{
+	if (!bIsArrayElement)
+		RegisterProperty(SProp, PrefixID, ClassDef, PropertyOffsets, Meta, Out);
+
+	const FSoftObjectPtr SoftPtr = SProp->GetPropertyValue(Data);
+	FSoftObjectPath Path = SoftPtr.ToSoftObjectPath();
+	Out << Path;
+
+	return Path.GetAssetPathString();
+}
+
 FString SpudPropertyUtil::WriteSubclassOfPropertyData(FClassProperty* CProp,
                                                       UClass* Class,
                                                       uint32 PrefixID,
@@ -583,6 +602,7 @@ bool SpudPropertyUtil::TryWriteUObjectPropertyData(FProperty* Property,
 	UObject* Obj = nullptr;
 	FObjectProperty* StrongProp = CastField<FObjectProperty>(Property);
 	FWeakObjectProperty* WeakProp = CastField<FWeakObjectProperty>(Property);
+	FSoftObjectProperty* SoftProp = CastField<FSoftObjectProperty>(Property);
 	
 	if (StrongProp)
 	{
@@ -593,7 +613,7 @@ bool SpudPropertyUtil::TryWriteUObjectPropertyData(FProperty* Property,
 		Obj = WeakProp->GetObjectPropertyValue(Data);
 	}
 
-	if (StrongProp || WeakProp)
+	if (StrongProp || WeakProp || SoftProp) 
 	{
 		// Nullrefs are OK, but if valid we need to check it's an Actor
 		if (IsActorObjectProperty(Property))
@@ -615,6 +635,11 @@ bool SpudPropertyUtil::TryWriteUObjectPropertyData(FProperty* Property,
 			// non-actor UObject
 			const FString Val = WriteNestedUObjectPropertyData(StrongProp, Obj, PrefixID, Data, bIsArrayElement, ClassDef,
 			                                                   PropertyOffsets, Meta, Out);
+			UE_LOG(LogSpudProps, Verbose, TEXT("%s = %s"), *GetLogPrefix(Property, Depth), *Val);
+		}
+		else if (SoftProp)
+		{
+			const FString Val = WriteSoftObjectPropertyData(SoftProp, PrefixID, Data, bIsArrayElement, ClassDef, PropertyOffsets, Meta, Out);
 			UE_LOG(LogSpudProps, Verbose, TEXT("%s = %s"), *GetLogPrefix(Property, Depth), *Val);
 		}
 		return true;
@@ -756,6 +781,20 @@ FString SpudPropertyUtil::ReadNestedUObjectPropertyData(FObjectProperty* OProp,
 	return Ret;
 }
 
+FString SpudPropertyUtil::ReadSoftObjectPropertyData(FSoftObjectProperty* SProp,
+												  void* Data,
+												  const FSpudClassMetadata& Meta,
+												  FArchive& In)
+{
+	FSoftObjectPath Path;
+	In << Path;
+
+	const FSoftObjectPtr SoftObjectPtr(Path);
+	SProp->SetPropertyValue(Data, SoftObjectPtr);
+
+	return SoftObjectPtr.ToString();
+}
+
 FString SpudPropertyUtil::ReadSubclassOfPropertyData(FClassProperty* CProp,
                                                      void* Data,
                                                      const RuntimeObjectMap* RuntimeObjects,
@@ -802,11 +841,10 @@ bool SpudPropertyUtil::TryReadUObjectPropertyData(FProperty* Prop, void* Data,
 {
 	FObjectProperty* StrongProp = CastField<FObjectProperty>(Prop);
 	FWeakObjectProperty* WeakProp = CastField<FWeakObjectProperty>(Prop);
+	FSoftObjectProperty* SoftProp = CastField<FSoftObjectProperty>(Prop);
 	
-	
-	if ((StrongProp || WeakProp) && StoredPropertyTypeMatchesRuntime(Prop, StoredProperty, true)) // we ignore array flag since we could be processing inner
+	if ((StrongProp || WeakProp || SoftProp) && StoredPropertyTypeMatchesRuntime(Prop, StoredProperty, true)) // we ignore array flag since we could be processing inner
 	{
-
 		// Nullrefs are OK, but if valid we need to check it's an Actor
 		// Actor refs supports both strong & weak object refs
 		if (IsActorObjectProperty(Prop))
@@ -822,6 +860,11 @@ bool SpudPropertyUtil::TryReadUObjectPropertyData(FProperty* Prop, void* Data,
 		else if (StrongProp) // Only strong refs for nested (owned)
 		{
 			const FString Val = ReadNestedUObjectPropertyData(StrongProp, Data, RuntimeObjects, Level, Outer, Meta, In);
+			UE_LOG(LogSpudProps, Verbose, TEXT("%s = %s"), *GetLogPrefix(Prop, Depth), *Val);
+		}
+		else if (SoftProp)
+		{
+			const FString Val = ReadSoftObjectPropertyData(SoftProp, Data, Meta, In);
 			UE_LOG(LogSpudProps, Verbose, TEXT("%s = %s"), *GetLogPrefix(Prop, Depth), *Val);
 		}
 		return true;
@@ -1137,16 +1180,13 @@ void SpudPropertyUtil::RestoreContainerProperty(UObject* RootObject, FProperty* 
 	
 }
 
-bool SpudPropertyUtil::StoredClassDefMatchesRuntime(const FSpudClassDef& ClassDef, const FSpudClassMetadata& Meta)
+bool SpudPropertyUtil::StoredClassDefMatchesRuntime(const FSpudClassDef& ClassDef, const UClass* RuntimeClass, const FSpudClassMetadata& Meta)
 {
 	// This implementation needs to iterate / recurse in *exactly* the same way as the Store methods for the same
 	// Class. The visitor pattern ensures that.
 	// We *could* generate a hash of properties to compare stored to runtime, but since we'd have to generate the runtime
 	// hash every time anyway, it's actually quicker to just iterate and fail on the first non-match than calculate an entire hash
 	// We'll cache this result per file load anyway
-	const FSoftClassPath CP(ClassDef.ClassName);
-	const auto RuntimeClass = CP.TryLoadClass<UObject>();
-
 	const auto StoredPropertyIterator = ClassDef.Properties.CreateConstIterator();
 
 	StoredMatchesRuntimePropertyVisitor Visitor(StoredPropertyIterator, ClassDef, Meta);
