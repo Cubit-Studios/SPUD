@@ -242,6 +242,8 @@ protected:
 	void SubscribeLevelObjectEvents(ULevel* Level);
 	void UnsubscribeLevelObjectEvents(ULevel* Level);
 	void UnsubscribeAllLevelObjectEvents();
+    // Unsubscribing from level streaming events of the monitored levels
+    void UnsubscribeFromMonitoredStreamingLevels();
 	
 	// This is a latent callback and has to be BlueprintCallable
 	UFUNCTION(BlueprintCallable)
@@ -278,7 +280,7 @@ protected:
 public:
 
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
-	virtual void Deinitialize() override;
+    virtual void Deinitialize() override;
 
 	UFUNCTION(BlueprintPure)
 	bool IsLoadingGame() const { return CurrentState == ESpudSystemState::LoadingGame; }

@@ -48,6 +48,22 @@ void USpudSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 #endif
 }
 
+void USpudSubsystem::UnsubscribeFromMonitoredStreamingLevels()
+{
+    // Clean up streaming level event listeners, as they may fire after we've been destroyed
+    for (auto It = MonitoredStreamingLevels.CreateIterator(); It; ++It)
+    {
+        ULevelStreaming* const Level = It.Key();
+        if (ensure(Level))
+        {
+            USpudStreamingLevelWrapper* const Wrapper = It.Value();
+            Level->OnLevelShown.RemoveAll(Wrapper);
+            Level->OnLevelHidden.RemoveAll(Wrapper);
+            It.RemoveCurrent();
+        }
+    }
+}
+
 void USpudSubsystem::Deinitialize()
 {
 	Super::Deinitialize();
@@ -57,18 +73,7 @@ void USpudSubsystem::Deinitialize()
 	FCoreUObjectDelegates::PreLoadMap.Remove(OnPreLoadMapHandle);
 	FWorldDelegates::OnSeamlessTravelTransition.Remove(OnSeamlessTravelHandle);
 
-	// Clean up streaming level event listeners, as they may fire after we've been destroyed
-	for (auto It = MonitoredStreamingLevels.CreateIterator(); It; ++It)
-	{
-		ULevelStreaming* const Level = It.Key();
-		if (ensure(Level))
-		{
-			USpudStreamingLevelWrapper* const Wrapper = It.Value();
-			Level->OnLevelShown.RemoveAll(Wrapper);
-			Level->OnLevelHidden.RemoveAll(Wrapper);
-			It.RemoveCurrent();
-		}
-	}
+	UnsubscribeFromMonitoredStreamingLevels();
 }
 
 
@@ -117,6 +122,7 @@ void USpudSubsystem::EndGame()
 	ActiveState = nullptr;
 
 	UnsubscribeAllLevelObjectEvents();
+    UnsubscribeFromMonitoredStreamingLevels();
 	CurrentState = ESpudSystemState::Disabled;
 	IsRestoringState = false;
 }
