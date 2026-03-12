@@ -106,6 +106,18 @@ void USpudSubsystem::NewGame(bool bCheckServerOnly, bool bAfterLevelLoad)
 	}
 }
 
+int32 USpudSubsystem::GetPlatformUserIndex() const
+{
+	if (const UGameInstance* GI = GetGameInstance())
+	{
+		if (const ULocalPlayer* LP = GI->GetFirstGamePlayer())
+		{
+			return LP->GetControllerId();
+		}
+	}
+	return 0;
+}
+
 bool USpudSubsystem::ServerCheck(bool LogWarning) const
 {
 	// Note: must only call this when game mode is present! Don't call when unloading
@@ -436,52 +448,100 @@ void USpudSubsystem::FinishSaveGame(const FString& SlotName, const FText& Title,
 		State->SetScreenshot(*ScreenshotData);
 
 #ifdef USE_SAVEGAMESYSTEM
-	// VIVI: Consoles require using the SaveGameSystem
-	ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
-	bool SaveOK;
-
-	if (SaveSystem)
+	// Console platforms: async save via ISaveGameSystem to avoid blocking the game thread during I/O.
+	// Phase 1 (synchronous): serialize state to memory buffer on the game thread.
+	// Phase 2 (asynchronous): platform save system writes the buffer to storage.
+	if (bAsyncSaveInFlight)
 	{
-		TArray<uint8> OutSaveData;
-		auto Archive = FMemoryWriter(OutSaveData, true);
-		State->SaveToArchive(Archive);
-		Archive.Close();
+		UE_LOG(LogSpudSubsystem, Warning, TEXT("FinishSaveGame: Async save already in flight for slot %s, ignoring request"), *SlotName);
+		return;
+	}
 
-		if (Archive.IsError() || Archive.IsCriticalError())
+	ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
+	if (!SaveSystem)
+	{
+		UE_LOG(LogSpudSubsystem, Error, TEXT("FinishSaveGame: No SaveGameSystem available"));
+		SaveComplete(SlotName, false);
+		return;
+	}
+
+	// Phase 1: Synchronous serialization to memory (game thread)
+	PendingSaveBuffer = MakeShared<TArray<uint8>>();
+	FMemoryWriter MemWriter(*PendingSaveBuffer, true);
+	State->SaveToArchive(MemWriter);
+	MemWriter.Close();
+
+	if (MemWriter.IsError() || MemWriter.IsCriticalError())
+	{
+		UE_LOG(LogSpudSubsystem, Error, TEXT("FinishSaveGame: Serialization error for slot %s"), *SlotName);
+		PendingSaveBuffer.Reset();
+		SaveComplete(SlotName, false);
+		return;
+	}
+
+	if (PendingSaveBuffer->Num() == 0 || SlotName.Len() == 0)
+	{
+		UE_LOG(LogSpudSubsystem, Error, TEXT("FinishSaveGame: Empty save data or slot name for slot %s"), *SlotName);
+		PendingSaveBuffer.Reset();
+		SaveComplete(SlotName, false);
+		return;
+	}
+
+	// Phase 2: Async I/O write via platform save system
+	bAsyncSaveInFlight = true;
+	const FString SaveSlotName = SlotName;
+	TWeakObjectPtr<USpudSubsystem> WeakThis(this);
+	const int32 UserIndex = GetPlatformUserIndex();
+	const FPlatformUserId PlatformUserId = FPlatformMisc::GetPlatformUserForUserIndex(UserIndex);
+
+	// Serialize metadata sidecar for efficient metadata extraction without loading the full save
+	TSharedPtr<TArray<uint8>> MetaBuffer = MakeShared<TArray<uint8>>();
+	{
+		FMemoryWriter MetaWriter(*MetaBuffer, true);
+		FSpudChunkedDataArchive MetaChunkedAr(MetaWriter);
+		State->SaveData.Info.WriteToArchive(MetaChunkedAr);
+		MetaWriter.Close();
+	}
+
+	OnSaveIOBegin.Broadcast(SaveSlotName);
+
+	SaveSystem->SaveGameAsync(
+		bAttemptToUsePlatformUI,
+		*SaveSlotName,
+		PlatformUserId,
+		PendingSaveBuffer.ToSharedRef(),
+		[WeakThis, SaveSlotName, SaveSystem, MetaBuffer, UserIndex](const FString& Name, FPlatformUserId UserId, bool bSuccess)
 		{
-			UE_LOG(LogSpudSubsystem, Error, TEXT("Error while creating save game for slot %s"), *SlotName);
-			SaveOK = false;
-		}
-		else
-		{
-			if (OutSaveData.Num() > 0 && SlotName.Len() > 0)
+			// ISaveGameSystem guarantees this callback fires on the game thread
+			if (USpudSubsystem* This = WeakThis.Get())
 			{
-				// VIVI: 0 = first player controller. Figure out if there's a better way to do this.
-				if (!SaveSystem->SaveGame(false, *SlotName, 0, OutSaveData))
+				This->bAsyncSaveInFlight = false;
+				This->PendingSaveBuffer.Reset();
+
+				if (bSuccess)
 				{
-					UE_LOG(LogSpudSubsystem, Error, TEXT("Error while saving game to %s"), *SlotName);
-					SaveOK = false;
+					UE_LOG(LogSpudSubsystem, Log, TEXT("Async save to slot %s: Success"), *SaveSlotName);
+
+					// Write metadata sidecar (synchronous -- tiny payload, <1KB)
+					const FString MetaSlotName = SaveSlotName + TEXT("_meta");
+					const FPlatformUserId MetaUserId = FPlatformMisc::GetPlatformUserForUserIndex(UserIndex);
+					if (!SaveSystem->SaveGame(This->bAttemptToUsePlatformUI, *MetaSlotName, MetaUserId, *MetaBuffer))
+					{
+						UE_LOG(LogSpudSubsystem, Warning, TEXT("Failed to write metadata sidecar for slot %s"), *SaveSlotName);
+					}
 				}
 				else
 				{
-					UE_LOG(LogSpudSubsystem, Log, TEXT("Save to slot %s: Success"), *SlotName);
-					SaveOK = true;
+					UE_LOG(LogSpudSubsystem, Error, TEXT("Async save to slot %s: Failed"), *SaveSlotName);
+					This->OnSaveError.Broadcast(SaveSlotName, ESpudSaveError::IOError);
 				}
-			}
-			else
-			{
-				UE_LOG(LogSpudSubsystem, Error, TEXT("Error while creating save game for slot %s"), *SlotName);
-				SaveOK = false;
+
+				This->OnSaveIOComplete.Broadcast(SaveSlotName, bSuccess);
+				This->SaveComplete(SaveSlotName, bSuccess);
 			}
 		}
-	}
-	else
-	{
-		SaveOK = false;
-	}
+	);
 
-	SaveComplete(SlotName, SaveOK);
-	
 #else
 	// UGameplayStatics::SaveGameToSlot prefixes our save with a lot of crap that we don't need
 	// And also wraps it with FObjectAndNameAsStringProxyArchive, which again we don't need
@@ -489,6 +549,9 @@ void USpudSubsystem::FinishSaveGame(const FString& SlotName, const FText& Title,
 	// I'm not sure if the save game system doesn't do this because of some console hardware issues, but
 	// I'll worry about that at some later point
 	IFileManager& FileMgr = IFileManager::Get();
+
+	OnSaveIOBegin.Broadcast(SlotName);
+
 	auto Archive = TUniquePtr<FArchive>(FileMgr.CreateFileWriter(*GetSaveGameFilePath(SlotName)));
 
 	bool SaveOK;
@@ -502,19 +565,41 @@ void USpudSubsystem::FinishSaveGame(const FString& SlotName, const FText& Title,
 		{
 			UE_LOG(LogSpudSubsystem, Error, TEXT("Error while saving game to %s"), *SlotName);
 			SaveOK = false;
+			OnSaveError.Broadcast(SlotName, ESpudSaveError::IOError);
 		}
 		else
 		{
 			UE_LOG(LogSpudSubsystem, Log, TEXT("Save to slot %s: Success"), *SlotName);
 			SaveOK = true;
+
+			// Write metadata sidecar for efficient metadata extraction
+			const FString MetaFilePath = FPaths::Combine(GetSaveGameDirectory(), SlotName + TEXT("_meta.sav"));
+			auto MetaArchive = TUniquePtr<FArchive>(FileMgr.CreateFileWriter(*MetaFilePath));
+			if (MetaArchive)
+			{
+				FSpudChunkedDataArchive MetaChunkedAr(*MetaArchive);
+				State->SaveData.Info.WriteToArchive(MetaChunkedAr);
+				MetaArchive->Close();
+
+				if (MetaArchive->IsError() || MetaArchive->IsCriticalError())
+				{
+					UE_LOG(LogSpudSubsystem, Warning, TEXT("Failed to write metadata sidecar for slot %s"), *SlotName);
+				}
+			}
+			else
+			{
+				UE_LOG(LogSpudSubsystem, Warning, TEXT("Failed to create metadata sidecar file for slot %s"), *SlotName);
+			}
 		}
 	}
 	else
 	{
 		UE_LOG(LogSpudSubsystem, Error, TEXT("Error while creating save game for slot %s"), *SlotName);
 		SaveOK = false;
+		OnSaveError.Broadcast(SlotName, ESpudSaveError::IOError);
 	}
 
+	OnSaveIOComplete.Broadcast(SlotName, SaveOK);
 	SaveComplete(SlotName, SaveOK);
 #endif
 }
@@ -624,35 +709,78 @@ void USpudSubsystem::LoadGame(const FString& SlotName, const FString& TravelOpti
 	State->ResetState();
 
 #ifdef USE_SAVEGAMESYSTEM
-	
-	// VIVI: Consoles require using the SaveGameSystem
-	ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
 
-	if (SaveSystem)
+	// Console platforms: async load via ISaveGameSystem to avoid blocking the game thread during I/O.
+	// Phase 1 (asynchronous): platform save system reads raw bytes from storage.
+	// Phase 2 (synchronous, game thread callback): deserialize and continue with post-load flow.
+	if (bAsyncLoadInFlight)
 	{
-		TArray<uint8> InSaveData;
-		if (SaveSystem->LoadGame(false, *SlotName, 0, InSaveData))
+		UE_LOG(LogSpudSubsystem, Warning, TEXT("LoadGame: Async load already in flight, ignoring request for slot %s"), *SlotName);
+		LoadComplete(SlotName, false);
+		return;
+	}
+
+	ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
+	if (!SaveSystem)
+	{
+		UE_LOG(LogSpudSubsystem, Error, TEXT("LoadGame: No SaveGameSystem available"));
+		LoadComplete(SlotName, false);
+		return;
+	}
+
+	bAsyncLoadInFlight = true;
+	const FString LoadSlotName = SlotName;
+	const FString LoadTravelOptions = TravelOptions;
+	TWeakObjectPtr<USpudSubsystem> WeakThis(this);
+	const FPlatformUserId PlatformUserId = FPlatformMisc::GetPlatformUserForUserIndex(GetPlatformUserIndex());
+
+	SaveSystem->LoadGameAsync(
+		bAttemptToUsePlatformUI,
+		*LoadSlotName,
+		PlatformUserId,
+		[WeakThis, LoadSlotName, LoadTravelOptions](const FString& Name, FPlatformUserId UserId, bool bSuccess, const TArray<uint8>& InSaveData)
 		{
-			auto Archive = FMemoryReader(InSaveData, true);
-			// Whole thing is in memory, might as well load it all
+			// ISaveGameSystem guarantees this callback fires on the game thread
+			USpudSubsystem* This = WeakThis.Get();
+			if (!This)
+			{
+				return;
+			}
+
+			This->bAsyncLoadInFlight = false;
+
+			if (!bSuccess || InSaveData.Num() == 0)
+			{
+				UE_LOG(LogSpudSubsystem, Error, TEXT("Async load from slot %s: Failed"), *LoadSlotName);
+				This->OnSaveError.Broadcast(LoadSlotName, ESpudSaveError::IOError);
+				This->LoadComplete(LoadSlotName, false);
+				return;
+			}
+
+			UE_LOG(LogSpudSubsystem, Log, TEXT("Async load from slot %s: I/O complete (%d bytes), deserializing"), *LoadSlotName, InSaveData.Num());
+
+			// Phase 2: Synchronous deserialization from memory (game thread, fast)
+			USpudState* State = This->GetActiveState();
+			FMemoryReader Archive(InSaveData, true);
 			State->LoadFromArchive(Archive, true);
 			Archive.Close();
 
 			if (Archive.IsError() || Archive.IsCriticalError())
 			{
-				UE_LOG(LogSpudSubsystem, Error, TEXT("Error while loading game from %s"), *SlotName);
-				LoadComplete(SlotName, false);
+				UE_LOG(LogSpudSubsystem, Error, TEXT("Async load from slot %s: Deserialization error"), *LoadSlotName);
+				This->OnSaveError.Broadcast(LoadSlotName, ESpudSaveError::CorruptedData);
+				This->LoadComplete(LoadSlotName, false);
 				return;
 			}
+
+			// Post-load flow: world package preload, global object restore, map travel
+			This->PostLoadDeserialization(LoadSlotName, LoadTravelOptions);
 		}
-		else
-		{
-			UE_LOG(LogSpudSubsystem, Error, TEXT("Error while loading game from %s"), *SlotName);
-			LoadComplete(SlotName, false);
-			return;
-		}
-	}
-	
+	);
+
+	// Async path: post-load logic runs in the callback above, not here
+	return;
+
 #else
 
 	// TODO: async load
@@ -669,19 +797,27 @@ void USpudSubsystem::LoadGame(const FString& SlotName, const FString& TravelOpti
 		if (Archive->IsError() || Archive->IsCriticalError())
 		{
 			UE_LOG(LogSpudSubsystem, Error, TEXT("Error while loading game from %s"), *SlotName);
+			OnSaveError.Broadcast(SlotName, ESpudSaveError::IOError);
 			LoadComplete(SlotName, false);
 			return;
 		}
 	}
 	else
 	{
-		UE_LOG(LogSpudSubsystem, Error, TEXT("Error while opening save game for slot %s"), *SlotName);		
+		UE_LOG(LogSpudSubsystem, Error, TEXT("Error while opening save game for slot %s"), *SlotName);
+		OnSaveError.Broadcast(SlotName, ESpudSaveError::IOError);
 		LoadComplete(SlotName, false);
 		return;
 	}
-	
+
 #endif
 
+	PostLoadDeserialization(SlotName, TravelOptions);
+}
+
+void USpudSubsystem::PostLoadDeserialization(const FString& SlotName, const FString& TravelOptions)
+{
+	USpudState* State = GetActiveState();
 
     // The world package gets loaded way before we end up loading the world
     // this cause an issue with the world being garbage collected from the package before we load, thus the load failing
@@ -707,7 +843,7 @@ void USpudSubsystem::LoadGame(const FString& SlotName, const FString& TravelOpti
 	        WorldToLoad = UWorld::FindWorldInPackage(WorldPackage);
 	    }
 	}
-	
+
 	// Just do the reverse of what we did
 	// Global objects first before map, these should be only objects which survive map load
 	for (auto Ptr : GlobalObjects)
@@ -724,7 +860,7 @@ void USpudSubsystem::LoadGame(const FString& SlotName, const FString& TravelOpti
 	// This is deferred, final load process will happen in PostLoadMap
 	SlotNameInProgress = SlotName;
 	UE_LOG(LogSpudSubsystem, Verbose, TEXT("(Re)loading map: %s"), *State->GetPersistentLevel());
-	
+
 	UGameplayStatics::OpenLevel(GetWorld(), FName(State->GetPersistentLevel()), true, TravelOptions);
 }
 
@@ -751,11 +887,22 @@ bool USpudSubsystem::DeleteSave(const FString& SlotName)
 
 	if (SaveSystem)
 	{
-		return SaveSystem->DeleteGame(false, *SlotName, 0);
+		const int32 UserIndex = GetPlatformUserIndex();
+
+		// Delete metadata sidecar (best-effort, ignore failure for legacy saves without one)
+		const FString MetaSlotName = SlotName + TEXT("_meta");
+		SaveSystem->DeleteGame(bAttemptToUsePlatformUI, *MetaSlotName, UserIndex);
+
+		return SaveSystem->DeleteGame(bAttemptToUsePlatformUI, *SlotName, UserIndex);
 	}
 	return false;
 #else
 	IFileManager& FileMgr = IFileManager::Get();
+
+	// Delete metadata sidecar (best-effort)
+	const FString MetaFilePath = FPaths::Combine(GetSaveGameDirectory(), SlotName + TEXT("_meta.sav"));
+	FileMgr.Delete(*MetaFilePath);
+
 	return FileMgr.Delete(*GetSaveGameFilePath(SlotName), false, true);
 #endif
 }
@@ -1029,6 +1176,15 @@ void USpudSubsystem::UpdateRegisteredComps()
 	}
 }
 
+bool USpudSubsystem::IsSaveIOInProgress() const
+{
+#ifdef USE_SAVEGAMESYSTEM
+	return bAsyncSaveInFlight;
+#else
+	return false;
+#endif
+}
+
 void USpudSubsystem::ForceReset()
 {
 	CurrentState = ESpudSystemState::RunningIdle;
@@ -1232,16 +1388,45 @@ USpudSaveGameInfo* USpudSubsystem::GetSaveGameInfo(const FString& SlotName)
 {
 
 #ifdef USE_SAVEGAMESYSTEM
-	
+
 	// VIVI: Consoles require using the SaveGameSystem
 	ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
 
 	if (SaveSystem)
 	{
+		const int32 UserIndex = GetPlatformUserIndex();
+
+		// Try metadata sidecar first (tiny file, avoids loading the entire save)
+		const FString MetaSlotName = SlotName + TEXT("_meta");
+		TArray<uint8> MetaData;
+		if (SaveSystem->LoadGame(bAttemptToUsePlatformUI, *MetaSlotName, UserIndex, MetaData) && MetaData.Num() > 0)
+		{
+			FMemoryReader MetaReader(MetaData, true);
+			FSpudChunkedDataArchive MetaChunkedAr(MetaReader);
+
+			FSpudSaveInfo SaveInfo;
+			SaveInfo.ReadFromArchive(MetaChunkedAr, 0);
+			MetaReader.Close();
+
+			if (!MetaReader.IsError() && !MetaReader.IsCriticalError())
+			{
+				auto Info = NewObject<USpudSaveGameInfo>();
+				Info->SlotName = SlotName;
+				Info->Title = SaveInfo.Title;
+				Info->Timestamp = SaveInfo.Timestamp;
+				if (SaveInfo.Screenshot.ImageData.Num() > 0)
+					Info->Thumbnail = FImageUtils::ImportBufferAsTexture2D(SaveInfo.Screenshot.ImageData);
+				else
+					Info->Thumbnail = nullptr;
+				Info->CustomInfo = NewObject<USpudCustomSaveInfo>();
+				Info->CustomInfo->SetData(SaveInfo.CustomInfo);
+				return Info;
+			}
+		}
+
+		// Fallback: load the full save (legacy saves without sidecar)
 		TArray<uint8> InSaveData;
-		// Usually we'd want to parse just the very first part of the file, not all of it.
-		// But the Save Game System has to give us the entire thing.
-		if (SaveSystem->LoadGame(false, *SlotName, 0, InSaveData))
+		if (SaveSystem->LoadGame(bAttemptToUsePlatformUI, *SlotName, UserIndex, InSaveData))
 		{
 			auto Archive = FMemoryReader(InSaveData, true);
 
@@ -1250,7 +1435,7 @@ USpudSaveGameInfo* USpudSubsystem::GetSaveGameInfo(const FString& SlotName)
 				UE_LOG(LogSpudSubsystem, Error, TEXT("Unable to open slot %s for reading info"), *SlotName);
 				return nullptr;
 			}
-			
+
 
 			auto Info = NewObject<USpudSaveGameInfo>();
 			Info->SlotName = SlotName;
@@ -1272,11 +1457,38 @@ USpudSaveGameInfo* USpudSubsystem::GetSaveGameInfo(const FString& SlotName)
 		return nullptr;
 	}
 
-	
+
 #else
 
 	IFileManager& FM = IFileManager::Get();
-	// We want to parse just the very first part of the file, not all of it
+
+	// Try metadata sidecar first (avoids opening the full save file)
+	const FString MetaFilePath = FPaths::Combine(GetSaveGameDirectory(), SlotName + TEXT("_meta.sav"));
+	auto MetaArchive = TUniquePtr<FArchive>(FM.CreateFileReader(*MetaFilePath));
+	if (MetaArchive)
+	{
+		FSpudChunkedDataArchive MetaChunkedAr(*MetaArchive);
+		FSpudSaveInfo SaveInfo;
+		SaveInfo.ReadFromArchive(MetaChunkedAr, 0);
+		MetaArchive->Close();
+
+		if (!MetaArchive->IsError() && !MetaArchive->IsCriticalError())
+		{
+			auto Info = NewObject<USpudSaveGameInfo>();
+			Info->SlotName = SlotName;
+			Info->Title = SaveInfo.Title;
+			Info->Timestamp = SaveInfo.Timestamp;
+			if (SaveInfo.Screenshot.ImageData.Num() > 0)
+				Info->Thumbnail = FImageUtils::ImportBufferAsTexture2D(SaveInfo.Screenshot.ImageData);
+			else
+				Info->Thumbnail = nullptr;
+			Info->CustomInfo = NewObject<USpudCustomSaveInfo>();
+			Info->CustomInfo->SetData(SaveInfo.CustomInfo);
+			return Info;
+		}
+	}
+
+	// Fallback: read from the full save file (legacy saves without sidecar)
 	FString AbsoluteFilename = FPaths::Combine(GetSaveGameDirectory(), SlotName + ".sav");
 	auto Archive = TUniquePtr<FArchive>(FM.CreateFileReader(*AbsoluteFilename));
 
@@ -1293,7 +1505,7 @@ USpudSaveGameInfo* USpudSubsystem::GetSaveGameInfo(const FString& SlotName)
 	Archive->Close();
 
 	return bResult ? Info : nullptr;
-	
+
 #endif
 }
 
@@ -1338,12 +1550,26 @@ void USpudSubsystem::ListSaveGameFiles(TArray<FString>& OutSaveFileList)
 
 	if (SaveSystem)
 	{
+		// Note: ListSaveGameFiles is static so we cannot call GetPlatformUserIndex().
+		// Fall back to user index 0 (consistent with default behavior).
 		SaveSystem->GetSaveGameNames(OutSaveFileList, 0);
+
+		// Filter out metadata sidecar entries so callers only see actual save slots
+		OutSaveFileList.RemoveAll([](const FString& Name)
+		{
+			return Name.EndsWith(TEXT("_meta"));
+		});
 	}
 #else
 	IFileManager& FM = IFileManager::Get();
 
 	FM.FindFiles(OutSaveFileList, *GetSaveGameDirectory(), TEXT(".sav"));
+
+	// Filter out metadata sidecar files so callers only see actual save slots
+	OutSaveFileList.RemoveAll([](const FString& Name)
+	{
+		return Name.Contains(TEXT("_meta.sav"));
+	});
 #endif
 }
 
@@ -1368,9 +1594,11 @@ public:
 	struct FUpgradeTask : public FNonAbandonableTask
 	{
 		bool bUpgradeAlways;
+		bool bAttemptToUseUI;
 		FSpudUpgradeSaveDelegate UpgradeCallback;
-		
-		FUpgradeTask(bool InUpgradeAlways, FSpudUpgradeSaveDelegate InCallback) : bUpgradeAlways(InUpgradeAlways), UpgradeCallback(InCallback) {}
+
+		FUpgradeTask(bool InUpgradeAlways, bool InAttemptToUseUI, FSpudUpgradeSaveDelegate InCallback)
+			: bUpgradeAlways(InUpgradeAlways), bAttemptToUseUI(InAttemptToUseUI), UpgradeCallback(InCallback) {}
 
 		bool SaveNeedsUpgrading(const USpudState* State)
 		{
@@ -1400,12 +1628,16 @@ public:
 
 			if (SaveSystem)
 			{
+				// Note: upgrade runs in a background thread where we cannot access the subsystem instance.
+				// Use user index 0 as a reasonable default for upgrade operations.
+				const int32 UserIndex = 0;
+
 				for (auto && SaveFile : SaveFiles)
 				{
 					TArray<uint8> InSaveData;
-					if (SaveSystem->LoadGame(false, *SaveFile, 0, InSaveData))
+					if (SaveSystem->LoadGame(bAttemptToUseUI, *SaveFile, UserIndex, InSaveData))
 					{
-						auto Archive = FMemoryReader(InSaveData, true);	
+						auto Archive = FMemoryReader(InSaveData, true);
 
 						auto State = NewObject<USpudState>();
 						// Load all data because we want to upgrade
@@ -1422,19 +1654,17 @@ public:
 						{
 							if (UpgradeCallback.Execute(State))
 							{
-								// VIVI: Do we really want to make a new "old" save?
-								SaveSystem->SaveGame(false, *FString::Printf(TEXT("%s_Backup"), *SaveFile), 0, InSaveData);
-								
+								SaveSystem->SaveGame(bAttemptToUseUI, *FString::Printf(TEXT("%s_Backup"), *SaveFile), UserIndex, InSaveData);
+
 								// Now save
 								TArray<uint8> OutSaveData;
 								auto OutArchive = FMemoryWriter(OutSaveData, true);
 								State->SaveToArchive(Archive);
 								OutArchive.Close();
-								
+
 								if (OutSaveData.Num() > 0 && SaveFile.Len() > 0)
 								{
-									// VIVI: 0 = first player controller. Figure out if there's a better way to do this.
-									if (!SaveSystem->SaveGame(false, *SaveFile, 0, OutSaveData))
+									if (!SaveSystem->SaveGame(bAttemptToUseUI, *SaveFile, UserIndex, OutSaveData))
 									{
 										UE_LOG(LogSpudSubsystem, Error, TEXT("Error while upgrading save %s"), *SaveFile);
 									}
@@ -1494,11 +1724,11 @@ public:
 
 	FAsyncTask<FUpgradeTask> UpgradeTask;
 
-	FUpgradeAllSavesAction(bool UpgradeAlways, FSpudUpgradeSaveDelegate InUpgradeCallback, const FLatentActionInfo& LatentInfo)
+	FUpgradeAllSavesAction(bool UpgradeAlways, bool InAttemptToUseUI, FSpudUpgradeSaveDelegate InUpgradeCallback, const FLatentActionInfo& LatentInfo)
         : ExecutionFunction(LatentInfo.ExecutionFunction)
         , OutputLink(LatentInfo.Linkage)
         , CallbackTarget(LatentInfo.CallbackTarget)
-        , UpgradeTask(UpgradeAlways, InUpgradeCallback)
+        , UpgradeTask(UpgradeAlways, InAttemptToUseUI, InUpgradeCallback)
 	{
 		// We do the actual upgrade work in a background task, this action is just to monitor when it's done
 		UpgradeTask.StartBackgroundTask();
@@ -1529,7 +1759,7 @@ void USpudSubsystem::UpgradeAllSaveGames(bool bUpgradeEvenIfNoUserDataModelVersi
 	{
 		LatentActionManager.AddNewAction(LatentInfo.CallbackTarget, LatentInfo.UUID,
 		                                 new FUpgradeAllSavesAction(bUpgradeEvenIfNoUserDataModelVersionDifferences,
-		                                                            SaveNeedsUpgradingCallback, LatentInfo));
+		                                                            bAttemptToUsePlatformUI, SaveNeedsUpgradingCallback, LatentInfo));
 	}
 }
 

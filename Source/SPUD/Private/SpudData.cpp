@@ -760,6 +760,64 @@ void FSpudLevelData::ReleaseMemory()
 	Status = LDS_Unloaded;
 }
 
+SIZE_T FSpudLevelData::GetEstimatedMemoryUsage() const
+{
+	SIZE_T Total = sizeof(FSpudLevelData);
+
+	// Level name string
+	Total += Name.GetAllocatedSize();
+
+	// Level actors: iterate map and sum per-object data buffers
+	for (const auto& Pair : LevelActors.Contents)
+	{
+		Total += Pair.Key.GetAllocatedSize();
+		Total += Pair.Value.Name.GetAllocatedSize();
+		Total += Pair.Value.Properties.Data.GetAllocatedSize();
+		Total += Pair.Value.Properties.PropertyOffsets.GetAllocatedSize();
+		Total += Pair.Value.CoreData.Data.GetAllocatedSize();
+		Total += Pair.Value.CustomData.Data.GetAllocatedSize();
+	}
+
+	// Spawned actors
+	for (const auto& Pair : SpawnedActors.Contents)
+	{
+		Total += Pair.Key.GetAllocatedSize();
+		Total += Pair.Value.Properties.Data.GetAllocatedSize();
+		Total += Pair.Value.Properties.PropertyOffsets.GetAllocatedSize();
+		Total += Pair.Value.CoreData.Data.GetAllocatedSize();
+		Total += Pair.Value.CustomData.Data.GetAllocatedSize();
+	}
+
+	// Destroyed actors
+	for (const auto& Item : DestroyedActors.Values)
+	{
+		if (Item.IsValid())
+		{
+			Total += Item->Name.GetAllocatedSize();
+		}
+	}
+
+	// Metadata: class definitions, name indexes
+	for (const auto& ClassDef : Metadata.ClassDefinitions.Values)
+	{
+		if (ClassDef.IsValid())
+		{
+			Total += ClassDef->ClassName.GetAllocatedSize();
+			Total += ClassDef->Properties.GetAllocatedSize();
+		}
+	}
+	for (const auto& Val : Metadata.ClassNameIndex.UniqueValues)
+	{
+		Total += Val.GetAllocatedSize();
+	}
+	for (const auto& Val : Metadata.PropertyNameIndex.UniqueValues)
+	{
+		Total += Val.GetAllocatedSize();
+	}
+
+	return Total;
+}
+
 
 //------------------------------------------------------------------------------
 

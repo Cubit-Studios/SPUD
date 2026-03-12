@@ -376,9 +376,39 @@ public:
 	/// This only reads the minimum needed to describe the save file and doesn't load any other data.
 	static bool LoadSaveInfoFromArchive(FArchive& SPUDAr, USpudSaveGameInfo& OutInfo);
 
+	// --- Level cache memory monitoring ---
+
+	/// Maximum memory budget for the in-memory level cache in MB.
+	/// When exceeded, a warning is logged after each level store operation.
+	/// Set to 0 to disable the budget check (default).
+	UPROPERTY(Config, BlueprintReadWrite, Category = "SPUD")
+	int32 LevelCacheMemoryBudgetMB = 0;
+
+	/// Whether to compress cached level data with LZ4 when stored in the in-memory cache.
+	/// Only effective on platforms using USE_SAVEGAMESYSTEM (consoles). Reduces memory at the cost of
+	/// CPU time during level store/restore. Does NOT affect the save file format.
+	/// NOTE: Currently reserved for future implementation. The flag is read but compression is not yet performed.
+	UPROPERTY(Config, BlueprintReadWrite, Category = "SPUD")
+	bool bCompressLevelCache = false;
+
+	/// Returns the total estimated memory usage (in bytes) of all cached level data currently in memory.
+	/// Only counts level data entries with LDS_Loaded status.
+	UFUNCTION(BlueprintPure, Category = "SPUD")
+	int64 GetLevelCacheMemoryUsage() const;
+
+	/// Returns the number of level data entries currently loaded in memory.
+	UFUNCTION(BlueprintPure, Category = "SPUD")
+	int32 GetLoadedLevelCount() const;
+
+protected:
+	/// Check the level cache memory budget after a store operation and log a warning if exceeded.
+	void CheckLevelCacheMemoryBudget();
+
+public:
+
 	bool bTestRequireSlowPath = false;
 	bool bTestRequireFastPath = false;
-	
+
 };
 
 /// Custom data that can be stored alongside properties for a UObject to handle anything else

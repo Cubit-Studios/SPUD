@@ -722,6 +722,10 @@ struct SPUD_API FSpudLevelData : public FSpudChunk
 	bool IsLoaded();
 	/// Release the memory associated with this level but keep basic data like Name
 	void ReleaseMemory();
+
+	/// Estimate the total memory usage of this level's data in bytes.
+	/// Accounts for metadata, actor maps, spawned actors, and destroyed actor arrays.
+	SIZE_T GetEstimatedMemoryUsage() const;
 	
 	/// Key value for indexing this item; name is unique
 	FString Key() const { return Name; }

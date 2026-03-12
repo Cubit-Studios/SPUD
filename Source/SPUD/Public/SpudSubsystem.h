@@ -13,10 +13,23 @@
 class USpudRuntimeStoredActorComponent;
 DECLARE_LOG_CATEGORY_EXTERN(LogSpudSubsystem, Verbose, Verbose);
 
+UENUM(BlueprintType)
+enum class ESpudSaveError : uint8
+{
+	None,
+	StorageFull,
+	CorruptedData,
+	UserSignedOut,
+	PermissionDenied,
+	IOError,
+	Unknown
+};
+
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FSpudPreLoadGame, const FString&, SlotName);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FSpudPostLoadGame, const FString&, SlotName, bool, bSuccess);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FSpudPreSaveGame, const FString&, SlotName);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FSpudPostSaveGame, const FString&, SlotName, bool, bSuccess);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FSpudSaveErrorDelegate, const FString&, SlotName, ESpudSaveError, Error);
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FSpudPreLevelStore, const FString&, LevelName);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FSpudOnLevelStore, const FString&, LevelName);
@@ -135,6 +148,28 @@ public:
 	UPROPERTY(BlueprintAssignable)
 	FSpudPostUnloadStreamingLevel PostUnloadStreamingLevel;
 
+	/** Whether to show platform-native save UI during save/load operations.
+	 * Some console TRCs require this for error dialogs (storage full, etc.).
+	 * Configure per-platform via DefaultEngine.ini overrides. */
+	UPROPERTY(Config, BlueprintReadWrite, Category = "SPUD")
+	bool bAttemptToUsePlatformUI = false;
+
+	/** Fired when a save or load operation fails, providing the slot name and error type */
+	UPROPERTY(BlueprintAssignable, Category = "SPUD")
+	FSpudSaveErrorDelegate OnSaveError;
+
+	/** Fired when async I/O write begins (after serialization, before platform write completes) */
+	UPROPERTY(BlueprintAssignable, Category = "SPUD")
+	FSpudPreSaveGame OnSaveIOBegin;
+
+	/** Fired when async I/O write completes (immediately before PostSaveGame) */
+	UPROPERTY(BlueprintAssignable, Category = "SPUD")
+	FSpudPostSaveGame OnSaveIOComplete;
+
+	/** Returns true if an async save I/O operation is currently in flight */
+	UFUNCTION(BlueprintPure, Category = "SPUD")
+	bool IsSaveIOInProgress() const;
+
 	/// The time delay after the last request for a streaming level is withdrawn, that the level will be unloaded
 	/// This is used to reduce load/unload thrashing at boundaries
 	UPROPERTY(BlueprintReadWrite, Config)
@@ -236,6 +271,10 @@ protected:
 	UPROPERTY()
 	TMap<TObjectPtr<ULevelStreaming>, TObjectPtr<USpudStreamingLevelWrapper>> MonitoredStreamingLevels;
 
+	/** Resolves the platform user index from the first local player's controller ID.
+	 * Falls back to 0 if no local player exists (e.g. during initialization). */
+	int32 GetPlatformUserIndex() const;
+
 	bool ServerCheck(bool LogWarning) const;
 
 	UFUNCTION()
@@ -275,8 +314,20 @@ protected:
 	void ResetScreenshotState();
 
 	void FinishSaveGame(const FString& SlotName, const FText& Title, const USpudCustomSaveInfo* ExtraInfo, TArray<uint8>* ScreenshotData);
+	/** Shared post-load logic: world package preload, global object restore, and map travel.
+	 *  Called after deserialization completes (synchronously on desktop, from async callback on console). */
+	void PostLoadDeserialization(const FString& SlotName, const FString& TravelOptions);
 	void LoadComplete(const FString& SlotName, bool bSuccess);
 	void SaveComplete(const FString& SlotName, bool bSuccess);
+
+#ifdef USE_SAVEGAMESYSTEM
+	/** Buffer holding serialized save data during async write. Kept alive via TSharedPtr until the async callback fires. */
+	TSharedPtr<TArray<uint8>> PendingSaveBuffer;
+	/** Whether an async save I/O operation is currently in flight */
+	bool bAsyncSaveInFlight = false;
+	/** Whether an async load I/O operation is currently in flight */
+	bool bAsyncLoadInFlight = false;
+#endif
 
 	void HandleLevelLoaded(FName LevelName);
 	void HandleLevelLoaded(ULevel* Level) { HandleLevelLoaded(FName(USpudState::GetLevelName(Level))); }

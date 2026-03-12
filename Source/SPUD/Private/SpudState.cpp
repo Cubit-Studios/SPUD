@@ -69,6 +69,8 @@ void USpudState::StoreLevel(ULevel* Level, bool bReleaseAfter, bool bBlocking)
 
 	if (bReleaseAfter)
 		ReleaseLevelData(LevelName, bBlocking);
+	else
+		CheckLevelCacheMemoryBudget();
 }
 
 USpudState::StorePropertyVisitor::StorePropertyVisitor(
@@ -1504,4 +1506,60 @@ TArray<FString> USpudState::GetLevelNames(bool bLoadedOnly)
 		}
 	}
 	return Ret;
+}
+
+int64 USpudState::GetLevelCacheMemoryUsage() const
+{
+	SIZE_T Total = 0;
+	// Take a snapshot under the map lock so the iteration is safe
+	FScopeLock MapLock(&const_cast<USpudState*>(this)->SaveData.LevelDataMapMutex);
+	for (const auto& Pair : SaveData.LevelDataMap)
+	{
+		const auto& LevelData = Pair.Value;
+		if (LevelData.IsValid())
+		{
+			FScopeLock LevelLock(&const_cast<FSpudLevelData&>(*LevelData).Mutex);
+			if (LevelData->Status == LDS_Loaded)
+			{
+				Total += LevelData->GetEstimatedMemoryUsage();
+			}
+		}
+	}
+	return static_cast<int64>(Total);
+}
+
+int32 USpudState::GetLoadedLevelCount() const
+{
+	int32 Count = 0;
+	FScopeLock MapLock(&const_cast<USpudState*>(this)->SaveData.LevelDataMapMutex);
+	for (const auto& Pair : SaveData.LevelDataMap)
+	{
+		const auto& LevelData = Pair.Value;
+		if (LevelData.IsValid())
+		{
+			FScopeLock LevelLock(&const_cast<FSpudLevelData&>(*LevelData).Mutex);
+			if (LevelData->Status == LDS_Loaded)
+			{
+				++Count;
+			}
+		}
+	}
+	return Count;
+}
+
+void USpudState::CheckLevelCacheMemoryBudget()
+{
+	if (LevelCacheMemoryBudgetMB <= 0)
+	{
+		return;
+	}
+
+	const int64 Usage = GetLevelCacheMemoryUsage();
+	const int64 BudgetBytes = static_cast<int64>(LevelCacheMemoryBudgetMB) * 1024 * 1024;
+	if (Usage > BudgetBytes)
+	{
+		UE_LOG(LogSpudState, Warning,
+			TEXT("SPUD level cache memory usage (%lld MB, %d levels loaded) exceeds budget (%d MB)"),
+			Usage / (1024 * 1024), GetLoadedLevelCount(), LevelCacheMemoryBudgetMB);
+	}
 }
