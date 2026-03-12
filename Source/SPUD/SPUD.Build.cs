@@ -49,6 +49,7 @@ public class SPUD : ModuleRules
 			new string[]
 			{
 				"ImageCore",
+				"StructUtils",
 			}
 			);
 		
