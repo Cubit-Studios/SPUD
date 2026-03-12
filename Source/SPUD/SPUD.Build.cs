@@ -8,7 +8,7 @@ public class SPUD : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
-		const bool ForceUseSaveGameSystem = false;
+		const bool ForceUseSaveGameSystem = true;
 
 		// We have to use the SaveGameSystem if the Target Platform
 		// isn't a known platform with an unrestricted filesystem

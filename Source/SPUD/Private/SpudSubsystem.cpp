@@ -811,8 +811,6 @@ void USpudSubsystem::LoadGame(const FString& SlotName, const FString& TravelOpti
 	}
 
 #endif
-
-	PostLoadDeserialization(SlotName, TravelOptions);
 }
 
 void USpudSubsystem::PostLoadDeserialization(const FString& SlotName, const FString& TravelOptions)
@@ -1159,7 +1157,7 @@ void USpudSubsystem::UpdateRegisteredComps()
 {
 	// Ticking registered comp's owner is moving outside the loaded area.
 	TArray<USpudRuntimeStoredActorComponent*> NeedToDestroyArray;
-	for (const auto RegComp : RegisteredRuntimeStoredActorComponents)
+	for (const auto& RegComp : RegisteredRuntimeStoredActorComponents)
 	{
 		bool bCellActivated;
 		RegComp->UpdateCurrentCell(bCellActivated);
@@ -1659,7 +1657,7 @@ public:
 								// Now save
 								TArray<uint8> OutSaveData;
 								auto OutArchive = FMemoryWriter(OutSaveData, true);
-								State->SaveToArchive(Archive);
+								State->SaveToArchive(OutArchive);
 								OutArchive.Close();
 
 								if (OutSaveData.Num() > 0 && SaveFile.Len() > 0)
